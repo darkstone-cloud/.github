@@ -1,0 +1,113 @@
+name: Branch Flow Guard
+
+# Zwei-Linien-Modell:
+#
+#   <feature|fix|task|hotfix>/*  ->  develop  ->  main
+#
+# Eine getrennte staging- neben einer production-Linie gab es frueher; sie ist
+# entfallen. Der Grund: fuer production wurde nie ein eigener Build erzeugt —
+# der Merge dorthin war reines Weiterreichen des Artefakts, das staging gebaut
+# hatte. Zwei Branches fuer einen Build sind Buchhaltung ohne Gegenwert. Baut
+# man stattdessen auf production neu, waere es ein zweites, nie getestetes
+# Binary — genau das, was die Trennung verhindern sollte.
+#
+# `main` ist damit die Release-Linie. Nebeneffekt: die semver-action erkennt
+# `main` von Haus aus als Release-Branch, der frueher noetige Sonderfall
+# "staging zaehlt als Release" faellt weg.
+
+on:
+  pull_request:
+    branches: [develop, main, master]
+    types: [opened, reopened, synchronize, edited]
+
+permissions:
+  contents: read
+
+jobs:
+  guard:
+    name: guard
+    # Eigene Laeufer im Docker-Swarm (Etiketten `self-hosted, swarm`). Die
+    # Organisation bekommt seit dem 13.08.2026 keine gehosteten Laeufer mehr
+    # zugeteilt (Ausgabensperre) — jeder Lauf dort endete nach Sekunden mit einem
+    # Job, der nicht einen einzigen Schritt ausgefuehrt hat. Drei Laeufer im
+    # Docker-Swarm (alissa, emily, florian), je ein Job gleichzeitig, also drei
+    # parallel statt bisher einem auf `vivian`.
+    #
+    # ⚠️ NUR `swarm`, NIEMALS ein Knotenname. Ein Knotenname bindet den Job an
+    # genau diese eine Maschine, statt ihn dem naechsten freien Laeufer zu geben.
+    #
+    # `guard` ist laut org-Ruleset `require-branch-flow-guard` Required Check fuer
+    # develop und main. Solange er keinen Runner bekommt, ist in diesem Repo KEIN
+    # PR mergebar — und was trotzdem gemergt wird, geht ungeprueft durch.
+    #
+    # Der Job ist reines Bash auf zwei Umgebungsvariablen: kein Docker, keine
+    # Toolchain, nichts, was der nackten Ubuntu-Basis des Runners fehlen koennte.
+    # Das ist geprueft, nicht angenommen — beim selben Umzug in
+    # gitops-vthree-clean fiel der erste Lauf darauf herein, dass der gehostete
+    # Runner helm und kubectl mitbrachte und die nackte Basis nicht.
+    runs-on: [self-hosted, swarm]
+    steps:
+      - name: Enforce <feature|fix|task|hotfix> -> develop -> main
+        env:
+          BASE: ${{ github.base_ref }}
+          HEAD: ${{ github.head_ref }}
+        run: |
+          set -euo pipefail
+          echo "PR-Fluss: '$HEAD' -> '$BASE'"
+
+          fail() {
+            echo "::error title=Branch Flow Guard::$1"
+            exit 1
+          }
+
+          case "$BASE" in
+            develop)
+              # Nur Arbeitszweige. Die Linien-Branches selbst duerfen NICHT
+              # nach develop zurueckfliessen — das waere die Rueckwaertsrichtung
+              # und hat frueher stillschweigend neuere Staende ueberschrieben.
+              #
+              # ⚠️ dependabot/* NICHT wieder entfernen. Dependabot benennt seine
+              # Zweige selbst (dependabot/<oekosystem>/<paket>-<version>) und
+              # bietet keinen Schalter, das Praefix zu aendern. Fehlt der Eintrag,
+              # scheitert der Waechter an JEDEM Dependabot-PR — und weil `guard`
+              # laut org-Ruleset `require-branch-flow-guard` Required Check auf
+              # develop und main ist, sind diese PRs damit dauerhaft unmergebar.
+              # Gemessene Folge im frontend: sieben offene Sicherheitsmeldungen,
+              # drei davon mit Schweregrad hoch (nanoid x2, postcss, vite), die
+              # wochenlang liegengeblieben sind.
+              # Der Eintrag gilt NUR hier bei develop: nach main geht auch
+              # Dependabot den regulaeren Weg ueber develop.
+              #
+              # ⚠️ feat/* NICHT wieder entfernen. `feat` ist der Typ, den
+              # Conventional Commits vorgibt, und entsprechend hat sich der
+              # Zweigname eingebuergert: 29 lebende feat/*-Zweige in den zwoelf
+              # Repos mit dieser Datei, gemessen am 21.08.2026 — gegenueber 84
+              # auf feature/*. cloud-volumes#121 war allein deswegen rot
+              # (`guard = FAILURE` bei gruenem `build-test-publish`).
+              # Die Alternative waere gewesen, dutzende Zweige umzubenennen.
+              # Das kostet mehr und schliesst gestapelte PRs — eine Falle, die
+              # in dieser Organisation bereits dreimal zugeschlagen hat.
+              # Wie dependabot/* gilt der Eintrag NUR hier bei develop.
+              case "$HEAD" in
+                feature/*|feat/*|fix/*|task/*|hotfix/*|dependabot/*)
+                  echo "OK: Arbeitszweig -> develop" ;;
+                *)
+                  fail "Nach develop darf nur feature/*, feat/*, fix/*, task/*, hotfix/* oder dependabot/* — '$HEAD' passt auf keins davon." ;;
+              esac ;;
+            main|master)
+              # Regulaer kommt alles ueber develop. hotfix/* ist die einzige
+              # Ausnahme: ein Produktionsfehler soll nicht darauf warten, dass
+              # develop gerade in einem release-faehigen Zustand ist.
+              # ⚠️ Ein hotfix/* muss danach ZUSAETZLICH nach develop, sonst
+              # holt der naechste regulaere Release den Fix wieder weg.
+              case "$HEAD" in
+                develop)
+                  echo "OK: develop -> main" ;;
+                hotfix/*)
+                  echo "OK: hotfix -> main (denselben Fix bitte auch nach develop bringen)" ;;
+                *)
+                  fail "Nach main darf nur 'develop' oder hotfix/* — '$HEAD' passt auf keins davon. Arbeitszweige gehen zuerst nach develop." ;;
+              esac ;;
+            *)
+              echo "Ziel '$BASE' ist nicht bewacht: OK" ;;
+          esac
